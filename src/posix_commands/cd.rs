@@ -2,7 +2,7 @@
 use std::os::windows::process::ExitStatusExt;
 use std::process::ExitStatus;
 
-pub fn cd(state: &mut State, args: &[&str]) -> Result<(), String> {
+pub fn cd(state: &mut State, args: Vec<String>) -> Result<(), String> {
     if args.len() > 1 {
         return Err("wpcsh: cd: too many arguments".to_string());
     }

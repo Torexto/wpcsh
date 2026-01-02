@@ -3,32 +3,43 @@ mod posix_commands;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write, stdin, stdout};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, PathBuf};
 use std::process::{Command, ExitStatus};
 
 struct State {
     home_dir: PathBuf,
     current_dir: PathBuf,
-    vars: HashMap<String, String>,
+    coreutils_commands: Vec<String>,
+    variables: HashMap<String, String>,
     aliases: HashMap<String, String>,
     exit_status: ExitStatus,
 }
 
+impl State {
+    pub fn new() -> Self {
+        let mut state = Self::default();
+
+        state.home_dir = dirs::home_dir().expect("Failed to get home directory");
+        state.current_dir = state.home_dir.clone();
+        state.variables = std::env::vars().collect::<HashMap<String, String>>();
+        state.coreutils_commands =
+            get_coreutils_commands().expect("Failed to get coreutils commands");
+
+        state
+    }
+}
+
 impl Default for State {
     fn default() -> Self {
-        let home_dir = dirs::home_dir().expect("Failed to get home directory");
         Self {
-            home_dir: home_dir.clone(),
-            current_dir: home_dir,
-            vars: HashMap::new(),
+            home_dir: PathBuf::new(),
+            current_dir: PathBuf::new(),
+            coreutils_commands: Vec::new(),
+            variables: HashMap::new(),
             aliases: HashMap::new(),
             exit_status: ExitStatus::default(),
         }
     }
-}
-
-fn path_to_str(path: &Path) -> &str {
-    path.to_str().unwrap_or("")
 }
 
 fn print_prefix(state: &State) {
@@ -91,70 +102,107 @@ fn load_rc(state: &mut State) {
             continue;
         }
 
-        if l.starts_with("export ") {
-            handle_export(state, &l[7..]);
-        } else if l.starts_with("alias ") {
-            handle_alias(state, &l[6..]);
-        }
+        execute_command(state, l)
+            .unwrap()
+            .expect("TODO: panic message");
     }
 }
 
-fn resolve_alias(state: &State, command: &str, args: &[&str]) -> (String, Vec<String>) {
+fn resolve_alias(state: &State, command: &str, args: &[String]) -> (String, Vec<String>) {
     if let Some(alias_cmd) = state.aliases.get(command) {
         let mut parts = alias_cmd.split_whitespace();
         if let Some(first) = parts.next() {
-            let new_args = parts.map(|s| s.to_string()).chain(args.iter().map(|s| s.to_string())).collect();
+            let new_args = parts
+                .map(|s| s.to_string())
+                .chain(args.iter().map(|s| s.to_string()))
+                .collect();
             return (first.to_string(), new_args);
         }
     }
-    (command.to_string(), args.iter().map(|s| s.to_string()).collect())
+    (
+        command.to_string(),
+        args.iter().map(|s| s.to_string()).collect(),
+    )
 }
 
-
-fn handle_export(state: &mut State, text: &str) {
+fn add_variable(state: &mut State, text: &str) {
     if let Some((key, val)) = text.split_once('=') {
         let val = val.trim_matches('"');
-        state.vars.insert(key.trim().to_string(), val.to_string());
-        unsafe { std::env::set_var(key.trim(), val) };
+        state
+            .variables
+            .insert(key.trim().to_string(), val.to_string());
     }
 }
 
-fn handle_alias(state: &mut State, text: &str) {
-    if let Some((name, cmd)) = text.split_once('=') {
-        let cmd = cmd.trim_matches('"');
-        state.aliases.insert(name.trim().to_string(), cmd.to_string());
+fn add_alias(state: &mut State, text: &str) {
+    if let Some((key, val)) = text.split_once('=') {
+        let val = val.trim_matches('"');
+        state
+            .aliases
+            .insert(key.trim().to_string(), val.to_string());
+    }
+}
+
+fn get_var(state: &State, var_name: &str) -> Option<String> {
+    if var_name == "?" {
+        Some(state.exit_status.code().unwrap_or(0).to_string())
+    } else {
+        None
     }
 }
 
 fn execute_command(state: &mut State, buffer: String) -> Option<Result<(), String>> {
-    let elements: Vec<&str> = buffer.trim().split_whitespace().collect();
-    let command = match elements.get(0) {
-        Some(c) => *c,
-        None => return Some(Ok(())),
-    };
-    let args = &elements[1..];
+    let elements: Vec<String> = buffer.trim().split_whitespace().map(String::from).collect();
 
-    match command {
+    let command = elements.get(0).unwrap_or(&String::new()).to_string();
+    let command = state.aliases.get(&command).unwrap_or(&command).to_owned();
+
+    let args: Vec<String> = elements[1..].iter().map(String::from).collect();
+
+    let mut args: Vec<String> = args
+        .into_iter()
+        .map(|arg| {
+            if arg.starts_with("$") {
+                let key = &arg[1..];
+                state
+                    .variables
+                    .get(key)
+                    .unwrap_or(&String::new())
+                    .to_string()
+            } else {
+                arg
+            }
+        })
+        .collect();
+
+    if state
+        .coreutils_commands
+        .binary_search(&command.to_string())
+        .is_ok()
+    {
+        let mut new_args: Vec<String> = vec![command];
+        new_args.append(&mut args);
+        return exec_external(state, "coreutils", &new_args);
+    };
+
+    match command.as_str() {
         "clear" => Some(clear_terminal()),
         "cd" => Some(posix_commands::cd::cd(state, args)),
-        "ls" => Some(posix_commands::ls::ls(state, args)),
-        "pwd" => Some(posix_commands::pwd::pwd(state)),
-        "echo" => Some(posix_commands::echo::echo(Some(state), args)),
         "export" => {
             for arg in args {
-                handle_export(state, arg);
+                add_variable(state, arg.as_str());
             }
             Some(Ok(()))
         }
         "alias" => {
             for arg in args {
-                handle_alias(state, arg);
+                add_alias(state, arg.as_str());
             }
             Some(Ok(()))
         }
         "exit" => None,
         _ => {
-            let (exec_command, exec_args) = resolve_alias(state, command, args);
+            let (exec_command, exec_args) = resolve_alias(state, &command, args.as_slice());
             let mut cmd = Command::new(exec_command);
             cmd.args(exec_args);
             match cmd.status() {
@@ -168,8 +216,36 @@ fn execute_command(state: &mut State, buffer: String) -> Option<Result<(), Strin
     }
 }
 
+fn exec_external(
+    state: &mut State,
+    command: &str,
+    args: &Vec<String>,
+) -> Option<Result<(), String>> {
+    let (cmd, exec_args) = resolve_alias(state, command, args);
+
+    match Command::new(&cmd).args(&exec_args).envs(state.variables.clone()).status() {
+        Ok(status) => {
+            state.exit_status = status;
+            Some(Ok(()))
+        }
+        Err(_) => Some(Err(format!("wpcsh: {}: command not found", cmd))),
+    }
+}
+
+fn get_coreutils_commands() -> std::io::Result<Vec<String>> {
+    let output = Command::new("coreutils").arg("--list").output()?;
+
+    let coreutils_commands = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let coreutils_commands = coreutils_commands
+        .split_whitespace()
+        .map(String::from)
+        .collect::<Vec<String>>();
+
+    Ok(coreutils_commands)
+}
+
 fn main() {
-    let mut state = State::default();
+    let mut state = State::new();
     load_rc(&mut state);
 
     let mut buf_reader = BufReader::new(stdin());
@@ -181,7 +257,10 @@ fn main() {
         print_prefix(&state);
 
         match buf_reader.read_line(&mut buff) {
-            Ok(_) => {
+            Ok(bytes) => {
+                if bytes == 0 {
+                    continue;
+                }
                 match execute_command(&mut state, buff.clone()) {
                     Some(result) => {
                         if let Err(err) = result {
