@@ -6,6 +6,6 @@ edition = "2024"
 
 [dependencies]
 dirs = "*"
-rustyline = "*"
-terminal_size = "*"
 linefeed = "*"
+atty = "*"
+signal-hook = "*"
