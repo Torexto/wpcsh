@@ -1,4 +1,6 @@
-﻿use std::collections::HashMap;
+﻿mod token;
+
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
@@ -46,6 +48,7 @@ fn tokenize(input: &str) -> Result<Vec<String>, ErrorKind> {
     Ok(tokens)
 }
 
+#[derive(Debug, Default)]
 pub struct Shell {
     home_dir: PathBuf,
     current_dir: PathBuf,
@@ -55,49 +58,57 @@ pub struct Shell {
 }
 
 impl Shell {
-    pub fn new() -> Self {
-        let mut state = Self::default();
+    pub fn new() -> Result<Self, ErrorKind> {
+        let home_dir = dirs::home_dir().ok_or(ErrorKind::NotFound)?;
 
-        state.home_dir = dirs::home_dir().expect("Failed to get home directory");
-        state.current_dir = state.home_dir.clone();
-        state.variables = std::env::vars().collect::<HashMap<String, String>>();
-        state.variables.insert(
+        use std::env;
+
+        let mut shell = Self {
+            home_dir: home_dir.clone(),
+            current_dir: home_dir,
+            variables: env::vars().collect::<HashMap<String, String>>(),
+            aliases: HashMap::new(),
+            exit_status: ExitStatus::default(),
+        };
+
+        shell.set_default_variables();
+
+        if env::set_current_dir(shell.current_dir.clone()).is_err() {
+            return Err(ErrorKind::InvalidInput);
+        };
+
+        shell.set_coreutils_alias();
+
+        Ok(shell)
+    }
+
+    fn set_default_variables(&mut self) {
+        self.variables.insert(
             "PWD".to_string(),
-            state.current_dir.clone().to_string_lossy().parse().unwrap(),
+            self.current_dir.to_string_lossy().to_string(),
         );
-        state.variables.insert(
+        self.variables.insert(
             "HOME".to_string(),
-            state.home_dir.clone().to_string_lossy().parse().unwrap(),
+            self.home_dir.to_string_lossy().to_string(),
         );
-        state.variables.insert(
+        self.variables.insert(
             "SHELL".to_string(),
-            "wpcsh".to_string(),
+            match std::env::current_exe() {
+                Ok(path) => path.to_string_lossy().to_string(),
+                Err(_) => "".to_string(),
+            },
         );
-        std::env::set_current_dir(state.current_dir.clone()).unwrap();
+    }
 
+    fn set_coreutils_alias(&mut self) {
         #[cfg(windows)]
         {
             let commands = get_coreutils_commands().expect("Failed to get coreutils commands");
 
             for command in commands.iter() {
-                state
-                    .aliases
+                self.aliases
                     .insert(command.to_string(), format!("coreutils {}", command));
             }
-        }
-
-        state
-    }
-}
-
-impl Default for Shell {
-    fn default() -> Self {
-        Self {
-            home_dir: PathBuf::new(),
-            current_dir: PathBuf::new(),
-            variables: HashMap::new(),
-            aliases: HashMap::new(),
-            exit_status: ExitStatus::default(),
         }
     }
 }
@@ -127,6 +138,17 @@ impl Shell {
 
         let buffer = buffer.trim();
 
+        // use crate::token;
+        // let mut lexer = token::Lexer::new(buffer);
+        //
+        // loop {
+        //     let token = lexer.next_token();
+        //     println!("{:?}", token);
+        //     if token == token::Token::Eof {
+        //         break;
+        //     }
+        // }
+
         let mut tokens = tokenize(buffer)?;
         tokens = self.resolve_alias(&tokens[0]);
         tokens.extend(
@@ -144,7 +166,7 @@ impl Shell {
 
     fn execute_command(&mut self, command: &mut CommandContainer) -> Result<(), ErrorKind> {
         match command.program.as_str() {
-            "clear" => clear_terminal(),
+            "clear" => self.clear_terminal(),
             "cd" => self.change_directory(&command.args),
             "export" => {
                 for arg in &command.args {
@@ -326,6 +348,9 @@ impl Shell {
             let val = val.trim_matches('"');
             self.variables
                 .insert(key.trim().to_string(), val.to_string());
+            self.exit_status = ExitStatus::from_raw(0);
+        } else {
+            self.exit_status = ExitStatus::from_raw(1);
         }
     }
 
@@ -333,6 +358,9 @@ impl Shell {
         if let Some((key, val)) = text.split_once('=') {
             let val = val.trim_matches('"');
             self.aliases.insert(key.trim().to_string(), val.to_string());
+            self.exit_status = ExitStatus::from_raw(0);
+        } else {
+            self.exit_status = ExitStatus::from_raw(1);
         }
     }
 
@@ -377,15 +405,26 @@ impl Shell {
         loop {
             let prompt = self.get_prompt();
 
-            interface.set_prompt(&prompt).expect("Failed to set prompt");
+            if interface.set_prompt(&prompt).is_err() {
+                interface.set_prompt(">").expect("Failed to set prompt");
+            };
 
             match interface.read_line() {
                 Ok(ReadResult::Input(line)) => {
                     interface.add_history(line.clone());
 
                     if let Err(err) = self.execute(&line) {
-                        if matches!(err, ErrorKind::Interrupted) {
-                            break;
+                        match err {
+                            ErrorKind::InvalidInput => {
+                                eprintln!("wpcsh: invalid input: {}", line);
+                            }
+                            ErrorKind::NotFound => {
+                                eprintln!("wpcsh: command not found: {}", line);
+                            }
+                            ErrorKind::Interrupted => {
+                                break;
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -395,7 +434,21 @@ impl Shell {
             }
 
             let _ = interface.save_history(&history_path);
-            println!();
+        }
+    }
+
+    fn clear_terminal(&mut self) -> Result<(), ErrorKind> {
+        print!("\x1B[2J\x1B[1;1H");
+        use std::io::Write;
+        match std::io::stdout().flush() {
+            Ok(_) => {
+                self.exit_status = ExitStatus::from_raw(0);
+                Ok(())
+            }
+            Err(_) => {
+                self.exit_status = ExitStatus::from_raw(1);
+                Err(ErrorKind::InvalidInput)
+            }
         }
     }
 }
@@ -415,14 +468,6 @@ fn normalize_path(path: PathBuf) -> PathBuf {
     }
 
     result
-}
-
-fn clear_terminal() -> Result<(), ErrorKind> {
-    print!("\x1B[2J\x1B[1;1H");
-    use std::io::Write;
-    std::io::stdout().flush().unwrap();
-
-    Ok(())
 }
 
 #[cfg(windows)]

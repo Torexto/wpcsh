@@ -50,7 +50,7 @@ fn main() {
 
     #[cfg(windows)]
     {
-        let mut shell = Shell::new();
+        let mut shell = Shell::new().unwrap();
         shell.run_interactive();
     }
 }
