@@ -17,7 +17,7 @@ pub enum Token {
     Heredoc,
 
     SingleQuoted(String),
-    DoubleQuoted(String),
+    DoubleQuoted(Vec<Token>),
 
     Variable(String),
     VariableBraced(String),
@@ -56,11 +56,10 @@ impl Lexer {
         ch
     }
 
-    fn starts_with(&self, s: &str) -> bool {
-        self.input[self.pos..]
-            .iter()
-            .zip(s.chars())
-            .all(|(a, b)| *a == b)
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), Some(' ' | '\t')) {
+            self.next();
+        }
     }
 
     pub fn next_token(&mut self) -> Token {
@@ -125,19 +124,18 @@ impl Lexer {
         }
     }
 
-    fn skip_whitespace(&mut self) {
-        while matches!(self.peek(), Some(' ' | '\t')) {
-            self.next();
-        }
-    }
-
     fn read_word(&mut self, first: char) -> Token {
         let mut buf = String::new();
         buf.push(first);
 
         while let Some(ch) = self.peek() {
             if ch.is_whitespace()
-                || matches!(ch, '|' | '&' | ';' | '<' | '>' | '(' | ')' | '{' | '}')
+                || matches!(
+                    ch,
+                    '|' | '&' | ';' | '<' | '>' |
+                    '(' | ')' | '{' | '}' |
+                    '"' | '\'' | '$'
+                )
             {
                 break;
             }
@@ -160,29 +158,44 @@ impl Lexer {
         buf
     }
 
-    fn read_double_quoted(&mut self) -> String {
+    fn read_double_quoted(&mut self) -> Vec<Token> {
+        let mut tokens = Vec::new();
         let mut buf = String::new();
 
         while let Some(ch) = self.next() {
             match ch {
                 '"' => break,
+
+                '$' => {
+                    if !buf.is_empty() {
+                        tokens.push(Token::Word(buf.clone()));
+                        buf.clear();
+                    }
+                    tokens.push(self.read_variable());
+                }
+
                 '\\' => {
                     if let Some(escaped) = self.next() {
                         buf.push(escaped);
                     }
                 }
+
                 _ => buf.push(ch),
             }
         }
 
-        buf
+        if !buf.is_empty() {
+            tokens.push(Token::Word(buf));
+        }
+
+        tokens
     }
 
     fn read_variable(&mut self) -> Token {
         if self.peek() == Some('{') {
             self.next();
-            let mut name = String::new();
 
+            let mut name = String::new();
             while let Some(ch) = self.next() {
                 if ch == '}' {
                     break;

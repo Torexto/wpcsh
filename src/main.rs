@@ -32,7 +32,7 @@ fn main() {
     {
         install_signal_handlers();
 
-        let mut shell = Shell::new();
+        let mut shell = Shell::new().unwrap();
 
         let login = is_login_shell();
         let interactive = is_interactive();

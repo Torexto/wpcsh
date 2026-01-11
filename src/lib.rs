@@ -1,52 +1,19 @@
-﻿mod token;
+﻿mod flash;
+mod token;
 
+use crate::token::{Lexer, Token};
 use std::collections::HashMap;
 use std::io::ErrorKind;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
 
 #[cfg(windows)]
 use std::os::windows::process::ExitStatusExt;
 
+use crate::flash::parser::Node;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
-
-fn tokenize(input: &str) -> Result<Vec<String>, ErrorKind> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut chars = input.chars().peekable();
-    let mut in_quotes = false;
-
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                in_quotes = !in_quotes;
-            }
-            ' ' | '\t' if !in_quotes => {
-                if !current.is_empty() {
-                    tokens.push(current.clone());
-                    current.clear();
-                }
-            }
-            '\\' => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                }
-            }
-            _ => current.push(c),
-        }
-    }
-
-    if in_quotes {
-        return Err(ErrorKind::InvalidInput); // niedomknięty cudzysłów
-    }
-
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-
-    Ok(tokens)
-}
 
 #[derive(Debug, Default)]
 pub struct Shell {
@@ -113,6 +80,7 @@ impl Shell {
     }
 }
 
+#[derive(Debug)]
 struct CommandContainer {
     program: String,
     args: Vec<String>,
@@ -126,45 +94,130 @@ impl CommandContainer {
 
 impl Shell {
     pub fn execute(&mut self, buffer: &str) -> Result<(), ErrorKind> {
-        let mut command = self.parse_command(buffer)?;
-        self.execute_command(&mut command)?;
+        let lexer = flash::lexer::Lexer::new(buffer);
+        let mut parser = flash::parser::Parser::new(lexer);
+        let node = parser.parse_script();
+
+        #[cfg(debug_assertions)]
+        dbg!(&node);
+
+        if let Node::List {
+            statements,
+            operators,
+        } = node
+        {
+            for statement in statements {
+                match statement {
+                    Node::Command {
+                        name,
+                        args,
+                        redirects,
+                    } => {
+                        let alias = self.resolve_alias(&name).unwrap_or(name.clone());
+                        let mut split = alias.split_whitespace();
+                        let name = split.next().unwrap_or(&name).to_string();
+                        let mut argv = split.map(String::from).collect::<Vec<String>>();
+                        argv.extend(args);
+                        self.execute_command(&mut CommandContainer::new(name, argv))?;
+                    }
+                    Node::Pipeline { .. } => {}
+                    Node::List { .. } => {}
+                    Node::Assignment { .. } => {}
+                    Node::CommandSubstitution { .. } => {}
+                    Node::ArithmeticExpansion { .. } => {}
+                    Node::ArithmeticCommand { .. } => {}
+                    Node::Subshell { .. } => {}
+                    Node::Comment(_) => {}
+                    Node::StringLiteral(_) => {}
+                    Node::SingleQuotedString(_) => {}
+                    Node::ExtGlobPattern { .. } => {}
+                    Node::IfStatement { .. } => {}
+                    Node::ElifBranch { .. } => {}
+                    Node::ElseBranch { .. } => {}
+                    Node::CaseStatement { .. } => {}
+                    Node::Array { .. } => {}
+                    Node::Function { .. } => {}
+                    Node::FunctionCall { .. } => {}
+                    Node::Export { name, value } => {
+                        match value.unwrap().deref() {
+                            Node::StringLiteral(value) => {
+                                self.add_variable(&format!("{}={}", name, value))
+                            }
+                            _ => {}
+                        };
+                    }
+                    Node::Return { .. } => {}
+                    Node::ExtendedTest { .. } => {}
+                    Node::HistoryExpansion { .. } => {}
+                    Node::Complete { .. } => {}
+                    Node::ForLoop { .. } => {}
+                    Node::WhileLoop { .. } => {}
+                    Node::UntilLoop { .. } => {}
+                    Node::Negation { .. } => {}
+                    Node::SelectStatement { .. } => {}
+                    Node::Group { .. } => {}
+                    Node::ParameterExpansion { .. } => {}
+                    Node::ProcessSubstitution { .. } => {}
+                }
+            }
+        }
         Ok(())
     }
 
-    fn parse_command(&self, buffer: &str) -> Result<CommandContainer, ErrorKind> {
-        if buffer.is_empty() {
+    fn parse_command(&self, input: &str) -> Result<CommandContainer, ErrorKind> {
+        let input = input.trim();
+        if input.is_empty() {
             return Err(ErrorKind::InvalidInput);
         }
 
-        let buffer = buffer.trim();
+        let mut lexer = Lexer::new(input);
 
-        // use crate::token;
-        // let mut lexer = token::Lexer::new(buffer);
-        //
-        // loop {
-        //     let token = lexer.next_token();
-        //     println!("{:?}", token);
-        //     if token == token::Token::Eof {
-        //         break;
-        //     }
-        // }
+        let mut argv: Vec<String> = vec![];
+        let mut first_word = true;
 
-        let mut tokens = tokenize(buffer)?;
-        tokens = self.resolve_alias(&tokens[0]);
-        tokens.extend(
-            tokenize(buffer)?[1..]
-                .iter()
-                .map(|a| self.resolve_variable(a)),
-        );
+        loop {
+            let token = lexer.next_token();
 
-        let command = CommandContainer::new(tokens[0].clone(), tokens[1..].to_vec());
+            match token {
+                Token::Eof | Token::Newline | Token::Semicolon => break,
+                Token::Word(word) => {
+                    if first_word {
+                        if let Some(alias) = self.resolve_alias(&word) {
+                            let t = self.parse_command(&alias)?;
+                            argv.push(t.program);
+                            argv.extend(t.args);
+                        } else {
+                            argv.push(word);
+                        }
+                        first_word = false;
+                    } else {
+                        argv.push(word);
+                    }
+                }
+                Token::Variable(var) => argv.push(self.resolve_variable(&var)),
+                Token::DoubleQuoted(tokens) => tokens.iter().for_each(|token| {
+                    let t = match token {
+                        Token::Word(word) => word.clone(),
+                        _ => todo!(),
+                    };
+                    argv.push(t);
+                }),
+                _ => unimplemented!(),
+            }
+        }
+        println!();
 
-        // println!("LOG: {} {}", &command.program, &command.args.join(" "));
+        let command = CommandContainer::new(argv[0].clone(), argv[1..].to_vec());
+
+        #[cfg(debug_assertions)]
+        println!("LOG: {} {}\n", &command.program, &command.args.join(" "));
 
         Ok(command)
     }
 
     fn execute_command(&mut self, command: &mut CommandContainer) -> Result<(), ErrorKind> {
+        #[cfg(debug_assertions)]
+        dbg!(&command);
         match command.program.as_str() {
             "clear" => self.clear_terminal(),
             "cd" => self.change_directory(&command.args),
@@ -267,26 +320,30 @@ impl Shell {
         }
     }
 
-    fn resolve_alias(&self, command: &str) -> Vec<String> {
-        let mut tokens = vec![command.to_owned()];
-        let mut seen = std::collections::HashSet::new();
-
-        while let Some(alias) = self.aliases.get(&tokens[0]) {
-            if !seen.insert(tokens[0].clone()) || seen.len() > 32 {
-                break;
-            }
-
-            let mut alias_tokens = match tokenize(alias) {
-                Ok(tokens) => tokens,
-                Err(_) => continue,
-            };
-
-            alias_tokens.extend(tokens.drain(1..));
-            tokens = alias_tokens;
-        }
-
-        tokens
+    fn resolve_alias(&self, word: &str) -> Option<String> {
+        self.aliases.get(word).cloned()
     }
+
+    // fn resolve_alias(&self, command: &str) -> Vec<String> {
+    //     let mut tokens = vec![command.to_owned()];
+    //     let mut seen = std::collections::HashSet::new();
+    //
+    //     while let Some(alias) = self.aliases.get(&tokens[0]) {
+    //         if !seen.insert(tokens[0].clone()) || seen.len() > 32 {
+    //             break;
+    //         }
+    //
+    //         let mut alias_tokens = match tokenize(alias) {
+    //             Ok(tokens) => tokens,
+    //             Err(_) => continue,
+    //         };
+    //
+    //         alias_tokens.extend(tokens.drain(1..));
+    //         tokens = alias_tokens;
+    //     }
+    //
+    //     tokens
+    // }
 
     fn resolve_variable(&self, arg: &str) -> String {
         let arg = arg.replace("~", &self.home_dir.to_string_lossy());
