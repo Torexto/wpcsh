@@ -293,6 +293,7 @@ impl Parser {
     }
 
     pub fn parse_statement(&mut self) -> Option<Node> {
+        dbg!(&self.current_token);
         match self.current_token.kind {
             TokenKind::Function => {
                 // Handle function keyword: function func_name { ... }
@@ -304,6 +305,7 @@ impl Parser {
                 }
             }
             TokenKind::Word(ref word) => {
+                dbg!(&word);
                 // Check for function definition: func_name() { ... }
                 if self.peek_token.kind == TokenKind::LParen {
                     // Use peek_next_token to look two tokens ahead for the ')'
@@ -1612,6 +1614,7 @@ impl Parser {
     pub fn parse_command(&mut self) -> Node {
         let name = match &self.current_token.kind {
             TokenKind::Word(word) => word.clone(),
+            TokenKind::Export => "export".to_string(),
             _ => String::new(),
         };
 

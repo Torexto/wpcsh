@@ -1,19 +1,26 @@
 ﻿mod flash;
 mod token;
 
-use crate::token::{Lexer, Token};
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::ErrorKind;
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::process::{Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus, Stdio};
 
 #[cfg(windows)]
 use std::os::windows::process::ExitStatusExt;
 
-use crate::flash::parser::Node;
+use crate::flash::parser::{Node, Redirect, RedirectKind};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
+
+const BUILTINS: &[&str] = &["cd", "exit", "export", "alias", "source", "clear"];
+
+fn is_builtin(command: &str) -> bool {
+    BUILTINS.contains(&command)
+}
 
 #[derive(Debug, Default)]
 pub struct Shell {
@@ -92,139 +99,239 @@ impl CommandContainer {
     }
 }
 
+fn apply_redirect(command: &mut Command, kind: &RedirectKind, target: &str) -> std::io::Result<()> {
+    match kind {
+        RedirectKind::Input => {
+            let file = File::open(target)?;
+            command.stdin(Stdio::from(file));
+        }
+        RedirectKind::Output => {
+            let file = File::create(target)?;
+            command.stdout(Stdio::from(file));
+        }
+        RedirectKind::Append => {
+            let file = OpenOptions::new().append(true).create(true).open(target)?;
+            command.stdout(Stdio::from(file));
+        }
+        RedirectKind::HereDoc | RedirectKind::HereDocDash => {
+            unimplemented!();
+            // let (mut reader, mut writer) = os_pipe::pipe()?;
+            // writer.write_all(target.as_bytes())?;
+            // drop(writer);
+            // command.stdin(Stdio::from(reader));
+        }
+        RedirectKind::HereString => {
+            unimplemented!();
+            // let (mut reader, mut writer) = os_pipe::pipe()?;
+            // writer.write_all(target.as_bytes())?;
+            // drop(writer);
+            // command.stdin(Stdio::from(reader));
+        }
+        RedirectKind::InputDup | RedirectKind::OutputDup => {
+            // tutaj trzeba użyć unsafe i dup2 na Unixie, na Windows użyj handli
+            unimplemented!()
+        }
+    }
+    Ok(())
+}
+
 impl Shell {
-    pub fn execute(&mut self, buffer: &str) -> Result<(), ErrorKind> {
+    pub fn execute(&mut self, buffer: &str) -> Result<i32, ErrorKind> {
         let lexer = flash::lexer::Lexer::new(buffer);
         let mut parser = flash::parser::Parser::new(lexer);
-        let node = parser.parse_script();
+        let statement = parser.parse_command();
 
         #[cfg(debug_assertions)]
-        dbg!(&node);
+        dbg!(&statement);
 
-        if let Node::List {
-            statements,
-            operators,
-        } = node
-        {
-            for statement in statements {
-                match statement {
-                    Node::Command {
+        match statement {
+            Node::Command {
+                name,
+                args,
+                redirects,
+            } => {
+                let (name, args) = self.resolve_alias(Cow::Owned(name), args);
+
+                if is_builtin(&name) {
+                    self.execute_command(&mut CommandContainer::new(name, args))
+                } else {
+                    let mut command = Command::new(name);
+                    command.envs(self.variables.iter()).args(args);
+
+                    for redirect in redirects.into_iter() {
+                        apply_redirect(&mut command, &redirect.kind, &redirect.file)
+                            .expect("Failed to apply redirect");
+                    }
+
+                    let status = command
+                        .spawn()
+                        .and_then(|mut c| c.wait())
+                        .expect("Failed to spawn child process");
+                    Ok(status.code().expect("Failed to get exit code"))
+                }
+            }
+            Node::Pipeline { commands } => {
+                let mut previous_stdout: Option<Stdio> = None;
+                let mut childrens: Vec<Child> = Vec::new();
+                let length = commands.len();
+
+                for (i, command) in commands.into_iter().enumerate() {
+                    if let Node::Command {
                         name,
                         args,
                         redirects,
-                    } => {
-                        let alias = self.resolve_alias(&name).unwrap_or(name.clone());
-                        let mut split = alias.split_whitespace();
-                        let name = split.next().unwrap_or(&name).to_string();
-                        let mut argv = split.map(String::from).collect::<Vec<String>>();
-                        argv.extend(args);
-                        self.execute_command(&mut CommandContainer::new(name, argv))?;
-                    }
-                    Node::Pipeline { .. } => {}
-                    Node::List { .. } => {}
-                    Node::Assignment { .. } => {}
-                    Node::CommandSubstitution { .. } => {}
-                    Node::ArithmeticExpansion { .. } => {}
-                    Node::ArithmeticCommand { .. } => {}
-                    Node::Subshell { .. } => {}
-                    Node::Comment(_) => {}
-                    Node::StringLiteral(_) => {}
-                    Node::SingleQuotedString(_) => {}
-                    Node::ExtGlobPattern { .. } => {}
-                    Node::IfStatement { .. } => {}
-                    Node::ElifBranch { .. } => {}
-                    Node::ElseBranch { .. } => {}
-                    Node::CaseStatement { .. } => {}
-                    Node::Array { .. } => {}
-                    Node::Function { .. } => {}
-                    Node::FunctionCall { .. } => {}
-                    Node::Export { name, value } => {
-                        match value.unwrap().deref() {
-                            Node::StringLiteral(value) => {
-                                self.add_variable(&format!("{}={}", name, value))
-                            }
-                            _ => {}
-                        };
-                    }
-                    Node::Return { .. } => {}
-                    Node::ExtendedTest { .. } => {}
-                    Node::HistoryExpansion { .. } => {}
-                    Node::Complete { .. } => {}
-                    Node::ForLoop { .. } => {}
-                    Node::WhileLoop { .. } => {}
-                    Node::UntilLoop { .. } => {}
-                    Node::Negation { .. } => {}
-                    Node::SelectStatement { .. } => {}
-                    Node::Group { .. } => {}
-                    Node::ParameterExpansion { .. } => {}
-                    Node::ProcessSubstitution { .. } => {}
-                }
-            }
-        }
-        Ok(())
-    }
+                    } = command
+                    {
+                        let (name, args) = self.resolve_alias(Cow::Owned(name), args);
 
-    fn parse_command(&self, input: &str) -> Result<CommandContainer, ErrorKind> {
-        let input = input.trim();
-        if input.is_empty() {
-            return Err(ErrorKind::InvalidInput);
-        }
+                        let mut command = Command::new(name);
+                        command.envs(self.variables.iter()).args(args);
 
-        let mut lexer = Lexer::new(input);
-
-        let mut argv: Vec<String> = vec![];
-        let mut first_word = true;
-
-        loop {
-            let token = lexer.next_token();
-
-            match token {
-                Token::Eof | Token::Newline | Token::Semicolon => break,
-                Token::Word(word) => {
-                    if first_word {
-                        if let Some(alias) = self.resolve_alias(&word) {
-                            let t = self.parse_command(&alias)?;
-                            argv.push(t.program);
-                            argv.extend(t.args);
-                        } else {
-                            argv.push(word);
+                        if let Some(stdin) = previous_stdout.take() {
+                            command.stdin(stdin);
                         }
-                        first_word = false;
-                    } else {
-                        argv.push(word);
+
+                        let is_last = i == length - 1;
+
+                        if !is_last {
+                            command.stdout(Stdio::piped());
+                        } else {
+                            command.stdout(Stdio::inherit());
+                        }
+
+                        for redirect in redirects.into_iter() {
+                            apply_redirect(&mut command, &redirect.kind, &redirect.file)
+                                .expect("Failed to apply redirect");
+                        }
+
+                        let mut child = command.spawn().expect("Failed to spawn child process");
+
+                        if !is_last {
+                            previous_stdout = Some(child.stdout.take().unwrap().into())
+                        }
+
+                        childrens.push(child);
                     }
                 }
-                Token::Variable(var) => argv.push(self.resolve_variable(&var)),
-                Token::DoubleQuoted(tokens) => tokens.iter().for_each(|token| {
-                    let t = match token {
-                        Token::Word(word) => word.clone(),
-                        _ => todo!(),
-                    };
-                    argv.push(t);
-                }),
-                _ => unimplemented!(),
+
+                let mut last_code = 0;
+                for mut child in childrens {
+                    let status = child.wait().ok();
+                    if let Some(code) = status.and_then(|s| s.code()) {
+                        last_code = code;
+                    }
+                }
+
+                Ok(last_code)
+            }
+            Node::List {
+                statements,
+                operators,
+            } => {
+                println!("{:?}", statements);
+                println!("{:?}", operators);
+                unimplemented!()
+            }
+            Node::Assignment { .. } => {
+                unimplemented!()
+            }
+            Node::CommandSubstitution { .. } => {
+                unimplemented!()
+            }
+            Node::ArithmeticExpansion { .. } => {
+                unimplemented!()
+            }
+            Node::ArithmeticCommand { .. } => {
+                unimplemented!()
+            }
+            Node::Subshell { .. } => {
+                unimplemented!()
+            }
+            Node::Comment(_) => {
+                unimplemented!()
+            }
+            Node::StringLiteral(_) => {
+                unimplemented!()
+            }
+            Node::SingleQuotedString(_) => {
+                unimplemented!()
+            }
+            Node::ExtGlobPattern { .. } => {
+                unimplemented!()
+            }
+            Node::IfStatement { .. } => {
+                unimplemented!()
+            }
+            Node::ElifBranch { .. } => {
+                unimplemented!()
+            }
+            Node::ElseBranch { .. } => {
+                unimplemented!()
+            }
+            Node::CaseStatement { .. } => {
+                unimplemented!()
+            }
+            Node::Array { .. } => {
+                unimplemented!()
+            }
+            Node::Function { .. } => {
+                unimplemented!()
+            }
+            Node::FunctionCall { .. } => {
+                unimplemented!()
+            }
+            Node::Export { name, value } => {
+                match value.unwrap().deref() {
+                    Node::StringLiteral(value) => self.add_variable(&format!("{}={}", name, value)),
+                    _ => {}
+                };
+                Ok(0)
+            }
+            Node::Return { .. } => {
+                unimplemented!()
+            }
+            Node::ExtendedTest { .. } => {
+                unimplemented!()
+            }
+            Node::HistoryExpansion { .. } => {
+                unimplemented!()
+            }
+            Node::Complete { .. } => {
+                unimplemented!()
+            }
+            Node::ForLoop { .. } => {
+                unimplemented!()
+            }
+            Node::WhileLoop { .. } => {
+                unimplemented!()
+            }
+            Node::UntilLoop { .. } => {
+                unimplemented!()
+            }
+            Node::Negation { .. } => {
+                unimplemented!()
+            }
+            Node::SelectStatement { .. } => {
+                unimplemented!()
+            }
+            Node::Group { .. } => {
+                unimplemented!()
+            }
+            Node::ParameterExpansion { .. } => {
+                unimplemented!()
+            }
+            Node::ProcessSubstitution { .. } => {
+                unimplemented!()
             }
         }
-        println!();
-
-        let command = CommandContainer::new(argv[0].clone(), argv[1..].to_vec());
-
-        #[cfg(debug_assertions)]
-        println!("LOG: {} {}\n", &command.program, &command.args.join(" "));
-
-        Ok(command)
     }
 
-    fn execute_command(&mut self, command: &mut CommandContainer) -> Result<(), ErrorKind> {
-        #[cfg(debug_assertions)]
-        dbg!(&command);
-        match command.program.as_str() {
+    fn execute_command(&mut self, command: &mut CommandContainer) -> Result<i32, ErrorKind> {
+        let _ = match command.program.as_str() {
             "clear" => self.clear_terminal(),
             "cd" => self.change_directory(&command.args),
             "export" => {
-                for arg in &command.args {
-                    self.add_variable(&arg);
-                }
+                self.add_variable(&command.args.join(" "));
                 Ok(())
             }
             "alias" => {
@@ -235,8 +342,10 @@ impl Shell {
             }
             "exit" => self.exit(command),
             "source" => self.source_command(command),
-            _ => self.execute_external_command(command),
-        }
+            _ => unreachable!()
+        };
+
+        Ok(0)
     }
 
     fn exit(&mut self, command: &CommandContainer) -> Result<(), ErrorKind> {
@@ -259,7 +368,7 @@ impl Shell {
     }
 
     fn source(&mut self, path: PathBuf) -> Result<(), ErrorKind> {
-        let file = match std::fs::File::open(&path) {
+        let file = match File::open(&path) {
             Ok(f) => f,
             Err(_) => return Err(ErrorKind::InvalidInput),
         };
@@ -308,20 +417,32 @@ impl Shell {
 
     fn get_result_of_external_command(
         &mut self,
-        command: &mut CommandContainer,
+        name: String,
+        args: Vec<String>,
+        redirects: Vec<Redirect>,
     ) -> Result<std::process::Output, ErrorKind> {
-        match Command::new(command.program.clone())
-            .args(command.args.clone())
-            .envs(self.variables.clone())
-            .output()
-        {
-            Ok(output) => Ok(output),
-            Err(err) => Err(err.kind()),
+        let (name, args) = self.resolve_alias(Cow::Owned(name), args);
+
+        let mut command = Command::new(name);
+        command.envs(self.variables.iter()).args(args);
+
+        for redirect in redirects.into_iter() {
+            apply_redirect(&mut command, &redirect.kind, &redirect.file)
+                .expect("Failed to apply redirect");
         }
+
+        let status = command.output().expect("Failed to execute child process");
+        Ok(status)
     }
 
-    fn resolve_alias(&self, word: &str) -> Option<String> {
-        self.aliases.get(word).cloned()
+    fn resolve_alias(&self, cmd: Cow<String>, args: Vec<String>) -> (String, Vec<String>) {
+        let alias = self.aliases.get(cmd.as_ref()).unwrap_or(cmd.as_ref());
+        let mut split = alias.split_whitespace();
+        let name = split.next().unwrap_or(cmd.as_ref()).to_string();
+        let mut argv = split.map(String::from).collect::<Vec<String>>();
+        argv.extend(args);
+
+        (name, argv)
     }
 
     // fn resolve_alias(&self, command: &str) -> Vec<String> {
@@ -422,12 +543,26 @@ impl Shell {
     }
 
     fn get_prompt(&mut self) -> String {
+        let t = &self.variables.get("PROMPT");
         if let Some(cmd) = self.variables.get("PROMPT") {
-            if let Ok(mut parsed) = self.parse_command(cmd) {
-                if let Ok(out) = self.get_result_of_external_command(&mut parsed) {
+            let lexer = flash::lexer::Lexer::new(cmd);
+            let mut parser = flash::parser::Parser::new(lexer);
+
+            let node = parser.parse_command();
+
+            if let Node::Command {
+                name,
+                args,
+                redirects,
+            } = node
+            {
+                dbg!(&name, &args, &redirects);
+                if let Ok(out) = self.get_result_of_external_command(name, args, redirects) {
                     return String::from_utf8_lossy(&out.stdout).to_string();
                 }
             }
+        } else {
+            dbg!("PROMPT not set");
         }
 
         format!("{} > ", self.current_dir.display())
@@ -484,8 +619,10 @@ impl Shell {
                             _ => {}
                         }
                     }
+                    std::io::stdout().flush().unwrap();
+                    println!();
                 }
-                Ok(ReadResult::Signal(Signal::Interrupt | Signal::Quit)) => break,
+                Ok(ReadResult::Signal(Signal::Quit)) => break,
                 Ok(ReadResult::Eof) => break,
                 _ => {}
             }

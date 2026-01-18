@@ -123,6 +123,7 @@ fn is_word_terminator(ch: char) -> bool {
 
 /// Lexer that converts input text into tokens
 #[derive(Clone)]
+#[derive(Debug)]
 pub struct Lexer {
     input: Vec<char>,
     pub position: usize,
