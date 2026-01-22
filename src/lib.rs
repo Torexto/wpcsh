@@ -151,6 +151,7 @@ impl Shell {
                 redirects,
             } => {
                 let (name, args) = self.resolve_alias(Cow::Owned(name), args);
+                let args = args.into_iter().map(|a| self.resolve_variable(Cow::Owned(a))).map(|a| a.to_string()).collect();
 
                 if is_builtin(&name) {
                     self.execute_command(&mut CommandContainer::new(name, args))
@@ -466,20 +467,24 @@ impl Shell {
     //     tokens
     // }
 
-    fn resolve_variable(&self, arg: &str) -> String {
-        let arg = arg.replace("~", &self.home_dir.to_string_lossy());
+    fn resolve_variable<'a>(&'a self, arg: Cow<'a, String>) -> Cow<'a, String> {
+        let arg = if arg.starts_with("~") {
+            Cow::Owned(arg.replace("~", &self.home_dir.to_string_lossy()))
+        } else {
+            arg
+        };
 
         if let Some(name) = arg.strip_prefix('$') {
             if name == "?" {
-                return self.exit_status.code().unwrap_or(0).to_string();
+                return Cow::Owned(self.exit_status.code().unwrap_or(0).to_string());
             }
 
             self.variables
                 .get(name)
-                .cloned()
-                .unwrap_or_else(|| arg.to_owned())
+                .and_then(|val| Option::from(Cow::Borrowed(val)))
+                .unwrap_or_else(|| arg)
         } else {
-            arg.to_owned()
+            arg
         }
     }
 
@@ -543,7 +548,6 @@ impl Shell {
     }
 
     fn get_prompt(&mut self) -> String {
-        let t = &self.variables.get("PROMPT");
         if let Some(cmd) = self.variables.get("PROMPT") {
             let lexer = flash::lexer::Lexer::new(cmd);
             let mut parser = flash::parser::Parser::new(lexer);
@@ -556,7 +560,6 @@ impl Shell {
                 redirects,
             } = node
             {
-                dbg!(&name, &args, &redirects);
                 if let Ok(out) = self.get_result_of_external_command(name, args, redirects) {
                     return String::from_utf8_lossy(&out.stdout).to_string();
                 }
