@@ -399,23 +399,6 @@ impl Shell {
         let _ = self.source(path);
     }
 
-    fn execute_external_command(
-        &mut self,
-        command: &mut CommandContainer,
-    ) -> Result<(), ErrorKind> {
-        match Command::new(command.program.clone())
-            .args(command.args.clone())
-            .envs(self.variables.clone())
-            .status()
-        {
-            Ok(status) => {
-                self.exit_status = status;
-                Ok(())
-            }
-            Err(err) => Err(err.kind()),
-        }
-    }
-
     fn get_result_of_external_command(
         &mut self,
         name: String,
@@ -468,24 +451,67 @@ impl Shell {
     // }
 
     fn resolve_variable<'a>(&'a self, arg: Cow<'a, String>) -> Cow<'a, String> {
-        let arg = if arg.starts_with("~") {
+        let arg = if arg.starts_with('~') {
             Cow::Owned(arg.replace("~", &self.home_dir.to_string_lossy()))
         } else {
             arg
         };
 
-        if let Some(name) = arg.strip_prefix('$') {
-            if name == "?" {
-                return Cow::Owned(self.exit_status.code().unwrap_or(0).to_string());
+        let input = arg.as_ref();
+        if !input.contains('$') {
+            return arg;
+        }
+
+        let mut out = String::with_capacity(input.len());
+        let mut i = 0;
+
+        while i < input.len() {
+            let ch = input[i..].chars().next().unwrap();
+            if ch != '$' {
+                out.push(ch);
+                i += ch.len_utf8();
+                continue;
             }
 
-            self.variables
-                .get(name)
-                .and_then(|val| Option::from(Cow::Borrowed(val)))
-                .unwrap_or_else(|| arg)
-        } else {
-            arg
+            let next = i + ch.len_utf8();
+            if next >= input.len() {
+                out.push('$');
+                break;
+            }
+
+            let next_ch = input[next..].chars().next().unwrap();
+            if next_ch == '?' {
+                out.push_str(&self.exit_status.code().unwrap_or(0).to_string());
+                i = next + next_ch.len_utf8();
+                continue;
+            }
+
+            if !next_ch.is_ascii_alphanumeric() {
+                out.push('$');
+                i = next;
+                continue;
+            }
+
+            let mut end = next;
+            for (offset, c) in input[next..].char_indices() {
+                if !c.is_ascii_alphanumeric() {
+                    break;
+                }
+                end = next + offset + c.len_utf8();
+            }
+
+            let name = &input[next..end];
+            if let Some(val) = self.variables.get(name) {
+                out.push_str(val);
+            } else {
+                out.push('$');
+                out.push_str(name);
+            }
+
+            i = end;
         }
+
+        Cow::Owned(out)
     }
 
     pub fn change_directory(&mut self, args: &[String]) -> Result<(), ErrorKind> {
